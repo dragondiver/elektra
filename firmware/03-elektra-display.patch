@@ -1,0 +1,264 @@
+diff --git a/main/Kconfig.projbuild b/main/Kconfig.projbuild
+index c0de794..24d35cb 100644
+--- a/main/Kconfig.projbuild
++++ b/main/Kconfig.projbuild
+@@ -925,6 +925,14 @@ config SEND_WAKE_WORD_DATA
+     help
+         Send wake word data to the server as the first message of the conversation and wait for response
+ 
++config ELEKTRA_SCHLAF_HELLIGKEIT
++    int "rundfunk: Hintergrundbeleuchtung im Schlaf (%)"
++    default 12
++    range 1 100
++    help
++        Helligkeit der Hintergrundbeleuchtung, wenn das Geraet schlaeft (idle).
++        Der atmende Ring muss vom Sofa aus sichtbar bleiben (12.09.2026).
++
+ config WAKE_WORD_DETECTION_IN_LISTENING
+     bool "Enable Wake Word Detection in Listening Mode"
+     default n
+diff --git a/main/boards/waveshare/esp32-s3-touch-lcd-1.85c/esp32-s3-touch-lcd-1.85c.cc b/main/boards/waveshare/esp32-s3-touch-lcd-1.85c/esp32-s3-touch-lcd-1.85c.cc
+index a4e1b90..f099bec 100644
+--- a/main/boards/waveshare/esp32-s3-touch-lcd-1.85c/esp32-s3-touch-lcd-1.85c.cc
++++ b/main/boards/waveshare/esp32-s3-touch-lcd-1.85c/esp32-s3-touch-lcd-1.85c.cc
+@@ -2,6 +2,7 @@
+ #include "codecs/no_audio_codec.h"
+ #include "codecs/box_audio_codec.h"
+ #include "display/lcd_display.h"
++#include "elektra_display.h"
+ #include "system_reset.h"
+ #include "application.h"
+ #include "button.h"
+@@ -16,9 +17,37 @@
+ #include <esp_lcd_st77916.h>
+ #include <esp_timer.h>
+ #include "esp_io_expander_tca9554.h"
++#include <esp_lcd_touch_cst816s.h>
++#include <esp_lvgl_port.h>
++#include <esp_adc/adc_oneshot.h>
++#include <esp_adc/adc_cali.h>
++#include <esp_adc/adc_cali_scheme.h>
+ 
+ #define TAG "waveshare_lcd_1_85c"
+ 
++// Akku: BAT_ADC liegt laut Schaltplan V2 an GPIO 8 (ADC1, Kanal 7), ueber
++// einen Teiler 200k/100k — die gemessene Spannung ist ein Drittel der
++// Zellenspannung. Eine Lithiumzelle ist zwischen 4,2 V und 3,4 V nicht
++// linear, deshalb Stuetzstellen statt Dreisatz.
++struct AkkuStuetzstelle { int mv; int prozent; };
++static const AkkuStuetzstelle AKKU_KENNLINIE[] = {
++    {4200, 100}, {4050, 90}, {3950, 80}, {3850, 60},
++    {3780, 40},  {3700, 20}, {3600, 10}, {3400, 0},
++};
++
++static int AkkuProzent(int mv) {
++    if (mv >= AKKU_KENNLINIE[0].mv) return 100;
++    const int n = sizeof(AKKU_KENNLINIE) / sizeof(AKKU_KENNLINIE[0]);
++    for (int i = 1; i < n; i++) {
++        const auto& hoch = AKKU_KENNLINIE[i - 1];
++        const auto& tief = AKKU_KENNLINIE[i];
++        if (mv >= tief.mv) {
++            return tief.prozent + (mv - tief.mv) * (hoch.prozent - tief.prozent) / (hoch.mv - tief.mv);
++        }
++    }
++    return 0;
++}
++
+ #define LCD_OPCODE_WRITE_CMD        (0x02ULL)
+ #define LCD_OPCODE_READ_CMD         (0x0BULL)
+ #define LCD_OPCODE_WRITE_COLOR      (0x32ULL)
+@@ -216,7 +245,50 @@ private:
+     Button boot_button_;
+     i2c_master_bus_handle_t i2c_bus_;
+     esp_io_expander_handle_t io_expander = NULL;
+-    LcdDisplay* display_;
++    ElektraDisplay* display_;
++    adc_oneshot_unit_handle_t akku_adc_ = nullptr;
++    adc_cali_handle_t akku_cali_ = nullptr;
++    int akku_mv_mittel_ = 0;          // gleitender Mittelwert ueber 8 Messungen
++    int64_t akku_zuletzt_us_ = 0;     // Messung alle 30 s
++
++    bool InitializeAkku() {
++        adc_oneshot_unit_init_cfg_t unit = {};
++        unit.unit_id = ADC_UNIT_1;
++        if (adc_oneshot_new_unit(&unit, &akku_adc_) != ESP_OK) {
++            ESP_LOGW(TAG, "Akku-ADC nicht verfuegbar");
++            return false;
++        }
++        adc_oneshot_chan_cfg_t kanal = {};
++        kanal.atten = ADC_ATTEN_DB_12;
++        kanal.bitwidth = ADC_BITWIDTH_12;
++        ESP_ERROR_CHECK(adc_oneshot_config_channel(akku_adc_, ADC_CHANNEL_7, &kanal));  // GPIO 8
++        adc_cali_curve_fitting_config_t cali = {};
++        cali.unit_id = ADC_UNIT_1;
++        cali.chan = ADC_CHANNEL_7;
++        cali.atten = ADC_ATTEN_DB_12;
++        cali.bitwidth = ADC_BITWIDTH_12;
++        if (adc_cali_create_scheme_curve_fitting(&cali, &akku_cali_) != ESP_OK) {
++            ESP_LOGW(TAG, "Akku-ADC ohne Kalibrierung");
++            akku_cali_ = nullptr;
++        }
++        return true;
++    }
++
++    int AkkuMillivolt() {
++        int roh = 0, mv = 0;
++        esp_err_t err = adc_oneshot_read(akku_adc_, ADC_CHANNEL_7, &roh);
++        if (err != ESP_OK) {
++            ESP_LOGW(TAG, "Akku-ADC lesen: %s", esp_err_to_name(err));
++            return 0;
++        }
++        if (akku_cali_) {
++            adc_cali_raw_to_voltage(akku_cali_, roh, &mv);
++        } else {
++            mv = roh * 3300 / 4095;
++        }
++        ESP_LOGI(TAG, "Akku-ADC roh %d -> %d mV am Pin", roh, mv);
++        return mv * 3;   // Teiler 200k/100k
++    }
+ 
+     void InitializeI2c() {
+         // Initialize I2C peripheral
+@@ -350,10 +422,94 @@ private:
+         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
+         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+ 
+-        display_ = new SpiLcdDisplay(panel_io, panel,
++        display_ = new ElektraDisplay(panel_io, panel,
+                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+     }
+ 
++
++    // Touch anmelden. Das Release-Image tut das nicht: der CST816 wird oben nur
++    // ueber den Portexpander zurueckgesetzt (zusammen mit dem LCD) und danach nie
++    // bei LVGL registriert — deshalb reagiert der Bildschirm nicht. Die Pins
++    // stehen laengst in config.h (TP_PIN_NUM_INT), sie wurden nur nie benutzt.
++    // Muster uebernommen von main/boards/waveshare/esp32-s3-touch-lcd-1.83.
++    void InitializeTouch() {
++        esp_lcd_touch_handle_t tp;
++        esp_lcd_touch_config_t tp_cfg = {
++            .x_max = DISPLAY_WIDTH - 1,
++            .y_max = DISPLAY_HEIGHT - 1,
++            .rst_gpio_num = TP_PIN_NUM_RST,   // GPIO_NUM_NC: Reset laeuft ueber den TCA9554
++            .int_gpio_num = TP_PIN_NUM_INT,
++            .levels = {
++                .reset = 0,
++                .interrupt = 0,
++            },
++            .flags = {
++                .swap_xy = 0,
++                .mirror_x = 0,
++                .mirror_y = 0,
++            },
++        };
++        esp_lcd_panel_io_handle_t tp_io_handle = NULL;
++        esp_lcd_panel_io_i2c_config_t tp_io_config = {};
++        tp_io_config.dev_addr = ESP_LCD_TOUCH_IO_I2C_CST816S_ADDRESS;
++        tp_io_config.scl_speed_hz = 400 * 1000;
++        tp_io_config.control_phase_bytes = 1;
++        tp_io_config.dc_bit_offset = 0;
++        tp_io_config.lcd_cmd_bits = 8;
++        tp_io_config.lcd_param_bits = 0;
++        tp_io_config.flags.disable_control_phase = 1;
++        ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle));
++        ESP_LOGI(TAG, "Initialize touch controller");
++        ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_cst816s(tp_io_handle, &tp_cfg, &tp));
++        const lvgl_port_touch_cfg_t touch_cfg = {
++            .disp = lv_display_get_default(),
++            .handle = tp,
++        };
++        lv_indev_t* indev = lvgl_port_add_touch(&touch_cfg);
++        if (indev == nullptr) {
++            ESP_LOGE(TAG, "Touch bei LVGL anmelden fehlgeschlagen");
++            return;
++        }
++
++        // Tippen startet und beendet das Gespraech — dieselbe Wirkung wie der
++        // BOOT-Taster, nur erreichbar. Der Grund: das Wake-Word ist die einzige
++        // Bedienung, und es ist unzuverlaessig (Espressifs Modelle sind auf
++        // englische Namen trainiert, ein eigenes Wort laeuft ueber MultiNet und
++        // ist fehleranfaelliger). Wer dreimal rufen muss, will einmal tippen.
++        //
++        // Bewusst die ganze Flaeche und kein Knopf: auf einem runden 360er
++        // Display ohne Zeigegeraet gibt es keinen falschen Ort zum Tippen, und
++        // eine Schaltflaeche muesste man erst finden. LV_EVENT_CLICKED statt
++        // PRESSED, damit ein Wischen ueber den Bildschirm nichts ausloest.
++        //
++        // Am Eingabegeraet angemeldet, nicht am Screen: die Anzeige legt einen
++        // bildschirmfuellenden Container ueber den Screen, und ein Klick darauf
++        // erreicht den Screen nie (kein EVENT_BUBBLE). LVGL schickt PRESSED/
++        // CLICKED zusaetzlich an den indev selbst, egal welches Objekt getroffen
++        // wurde (lv_indev.c, send_event) — der erste Versuch am Screen blieb
++        // deshalb stumm (12.09.2026).
++        lv_indev_add_event_cb(indev, [](lv_event_t* e) {
++            auto& app = Application::GetInstance();
++            if (app.GetDeviceState() == kDeviceStateStarting) {
++                return;   // waehrend des Startens nichts tun
++            }
++            lv_point_t p;
++            lv_indev_get_point(lv_indev_active(), &p);
++            auto* display = static_cast<ElektraDisplay*>(Board::GetInstance().GetDisplay());
++            if (const char* art = display->SymbolAn(p.x, p.y)) {
++                // #9: Tipp auf ein Symbol — die Bridge liest den Rueckruf oder die
++                // Erinnerung vor. Kein Gespraech umschalten.
++                ESP_LOGI(TAG, "Symbol angetippt: %s", art);
++                app.SendeRundfunk(std::string("{\"type\":\"rundfunk\",\"tipp\":\"") + art + "\"}");
++                return;
++            }
++            ESP_LOGI(TAG, "Bildschirm angetippt — Gespraech umschalten");
++            app.ToggleChatState();
++        }, LV_EVENT_CLICKED, nullptr);
++
++        ESP_LOGI(TAG, "Touch panel initialized successfully");
++    }
++
+     void InitializeButtons() {
+         boot_button_.OnClick([this]() {
+             auto& app = Application::GetInstance();
+@@ -372,7 +528,9 @@ public:
+         InitializeTca9554();
+         InitializeSpi();
+         Initializest77916Display();
++        InitializeTouch();
+         InitializeButtons();
++        InitializeAkku();
+         GetBacklight()->RestoreBrightness();
+     }
+ 
+@@ -388,7 +546,8 @@ public:
+     #ifdef CONFIG_VERSION_2_0
+     virtual AudioCodec* GetAudioCodec() override {
+         static BoxAudioCodec audio_codec(i2c_bus_, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
+-            AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR, AUDIO_CODEC_ES7210_ADDR, AUDIO_INPUT_REFERENCE);
++            AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR, AUDIO_CODEC_ES7210_ADDR, AUDIO_INPUT_REFERENCE,
++            30.0f, -1, 0.0f, 2);  // rundfunk: beide Mikrofone; Gain 30 dB (37,5 uebersteuerte aus der Naehe, der Erkenner hat WAKE_GAIN; 13.09.2026)
+             return &audio_codec;
+     }
+     #endif
+@@ -396,6 +555,26 @@ public:
+     virtual Display* GetDisplay() override {
+         return display_;
+     }
++
++    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
++        if (akku_adc_ == nullptr) return false;
++        int64_t jetzt = esp_timer_get_time();
++        if (akku_zuletzt_us_ == 0 || jetzt - akku_zuletzt_us_ > 30 * 1000 * 1000) {
++            int mv = AkkuMillivolt();
++            if (mv > 0) {   // 0 = Lesefehler, nicht in den Mittelwert mischen
++                akku_mv_mittel_ = akku_mv_mittel_ == 0 ? mv : (akku_mv_mittel_ * 7 + mv) / 8;
++            }
++            akku_zuletzt_us_ = jetzt;
++            ESP_LOGI(TAG, "Akku: %d mV -> %d %%", akku_mv_mittel_, AkkuProzent(akku_mv_mittel_));
++        }
++        if (akku_mv_mittel_ < 2500) {
++            return false;       // kein Akku am Messpunkt (Schalter aus oder nicht bestueckt)
++        }
++        level = AkkuProzent(akku_mv_mittel_);
++        charging = false;       // ETA6098 hat keinen Pin am ESP (Schaltplan V2)
++        discharging = true;
++        return true;
++    }
+     
+     virtual Backlight* GetBacklight() override {
+         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);

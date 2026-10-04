@@ -1,0 +1,102 @@
+diff --git a/main/boards/waveshare/esp32-s3-touch-lcd-1.85c/esp32-s3-touch-lcd-1.85c.cc b/main/boards/waveshare/esp32-s3-touch-lcd-1.85c/esp32-s3-touch-lcd-1.85c.cc
+index a4e1b90..4d375af 100644
+--- a/main/boards/waveshare/esp32-s3-touch-lcd-1.85c/esp32-s3-touch-lcd-1.85c.cc
++++ b/main/boards/waveshare/esp32-s3-touch-lcd-1.85c/esp32-s3-touch-lcd-1.85c.cc
+@@ -16,6 +16,8 @@
+ #include <esp_lcd_st77916.h>
+ #include <esp_timer.h>
+ #include "esp_io_expander_tca9554.h"
++#include <esp_lcd_touch_cst816s.h>
++#include <esp_lvgl_port.h>
+ 
+ #define TAG "waveshare_lcd_1_85c"
+ 
+@@ -354,6 +356,80 @@ private:
+                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+     }
+ 
++
++    // Touch anmelden. Das Release-Image tut das nicht: der CST816 wird oben nur
++    // ueber den Portexpander zurueckgesetzt (zusammen mit dem LCD) und danach nie
++    // bei LVGL registriert — deshalb reagiert der Bildschirm nicht. Die Pins
++    // stehen laengst in config.h (TP_PIN_NUM_INT), sie wurden nur nie benutzt.
++    // Muster uebernommen von main/boards/waveshare/esp32-s3-touch-lcd-1.83.
++    void InitializeTouch() {
++        esp_lcd_touch_handle_t tp;
++        esp_lcd_touch_config_t tp_cfg = {
++            .x_max = DISPLAY_WIDTH - 1,
++            .y_max = DISPLAY_HEIGHT - 1,
++            .rst_gpio_num = TP_PIN_NUM_RST,   // GPIO_NUM_NC: Reset laeuft ueber den TCA9554
++            .int_gpio_num = TP_PIN_NUM_INT,
++            .levels = {
++                .reset = 0,
++                .interrupt = 0,
++            },
++            .flags = {
++                .swap_xy = 0,
++                .mirror_x = 0,
++                .mirror_y = 0,
++            },
++        };
++        esp_lcd_panel_io_handle_t tp_io_handle = NULL;
++        esp_lcd_panel_io_i2c_config_t tp_io_config = {};
++        tp_io_config.dev_addr = ESP_LCD_TOUCH_IO_I2C_CST816S_ADDRESS;
++        tp_io_config.scl_speed_hz = 400 * 1000;
++        tp_io_config.control_phase_bytes = 1;
++        tp_io_config.dc_bit_offset = 0;
++        tp_io_config.lcd_cmd_bits = 8;
++        tp_io_config.lcd_param_bits = 0;
++        tp_io_config.flags.disable_control_phase = 1;
++        ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle));
++        ESP_LOGI(TAG, "Initialize touch controller");
++        ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_cst816s(tp_io_handle, &tp_cfg, &tp));
++        const lvgl_port_touch_cfg_t touch_cfg = {
++            .disp = lv_display_get_default(),
++            .handle = tp,
++        };
++        lv_indev_t* indev = lvgl_port_add_touch(&touch_cfg);
++        if (indev == nullptr) {
++            ESP_LOGE(TAG, "Touch bei LVGL anmelden fehlgeschlagen");
++            return;
++        }
++
++        // Tippen startet und beendet das Gespraech — dieselbe Wirkung wie der
++        // BOOT-Taster, nur erreichbar. Der Grund: das Wake-Word ist die einzige
++        // Bedienung, und es ist unzuverlaessig (Espressifs Modelle sind auf
++        // englische Namen trainiert, ein eigenes Wort laeuft ueber MultiNet und
++        // ist fehleranfaelliger). Wer dreimal rufen muss, will einmal tippen.
++        //
++        // Bewusst die ganze Flaeche und kein Knopf: auf einem runden 360er
++        // Display ohne Zeigegeraet gibt es keinen falschen Ort zum Tippen, und
++        // eine Schaltflaeche muesste man erst finden. LV_EVENT_CLICKED statt
++        // PRESSED, damit ein Wischen ueber den Bildschirm nichts ausloest.
++        //
++        // Am Eingabegeraet angemeldet, nicht am Screen: die Anzeige legt einen
++        // bildschirmfuellenden Container ueber den Screen, und ein Klick darauf
++        // erreicht den Screen nie (kein EVENT_BUBBLE). LVGL schickt PRESSED/
++        // CLICKED zusaetzlich an den indev selbst, egal welches Objekt getroffen
++        // wurde (lv_indev.c, send_event) — der erste Versuch am Screen blieb
++        // deshalb stumm (12.09.2026).
++        lv_indev_add_event_cb(indev, [](lv_event_t* e) {
++            auto& app = Application::GetInstance();
++            if (app.GetDeviceState() == kDeviceStateStarting) {
++                return;   // waehrend des Startens nichts tun
++            }
++            ESP_LOGI(TAG, "Bildschirm angetippt — Gespraech umschalten");
++            app.ToggleChatState();
++        }, LV_EVENT_CLICKED, nullptr);
++
++        ESP_LOGI(TAG, "Touch panel initialized successfully");
++    }
++
+     void InitializeButtons() {
+         boot_button_.OnClick([this]() {
+             auto& app = Application::GetInstance();
+@@ -372,6 +448,7 @@ public:
+         InitializeTca9554();
+         InitializeSpi();
+         Initializest77916Display();
++        InitializeTouch();
+         InitializeButtons();
+         GetBacklight()->RestoreBrightness();
+     }

@@ -1,0 +1,43 @@
+# rundfunk: eigener Firmware-Bau für das Waveshare ESP32-S3-Touch-LCD-1.85C.
+#
+# Warum überhaupt selbst bauen:
+#   - Touch: das Release-Image meldet den CST816 nie bei LVGL an
+#   - Wake-Word: nur Espressifs fertige Namen, kein eigenes Wort
+#   - Ansagen: das Release spricht Chinesisch
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_1_85C=y
+CONFIG_VERSION_2_0=y
+
+# Deutsche Systemansagen statt der chinesischen aus dem Release-Image.
+CONFIG_LANGUAGE_DE_DE=y
+
+# OTA-Adresse ab Werk auf die Bridge. Ohne das zeigt ein frisch geflashtes
+# Gerät auf api.tenclass.net und muss jedes Mal über das WLAN-Portal
+# umgestellt werden — und dort wird der zweite Speicherknopf gern übersehen
+# (spike/README.md). Im NVS gesetzte Adressen haben weiterhin Vorrang.
+CONFIG_OTA_URL="http://<bridge-host>:8003/xiaozhi/ota/"
+
+# Wake-Word "Elektra".
+#
+# Espressif hat kein fertiges Elektra-Modell — die rund 80 WakeNet-Modelle
+# tragen feste Namen (Jarvis, Alexa, Computer ...). Ein frei gewaehltes Wort
+# geht nur ueber MultiNet, den Lauterkenner.
+#
+# Wie der Motorwechsel funktioniert (main/audio/engines/afe_audio_engine.cc):
+# Ist ein MultiNet-Modell in den Assets, gewinnt es gegen WakeNet. Die Sprache
+# kommt dann aus index.json, das der Assets-Bau aus diesen Optionen erzeugt —
+# NICHT aus der fest verdrahteten Zeile `language_ = "cn"` in
+# custom_wake_word.cc, die nur greift, wenn gar keine Assets vorhanden sind.
+#
+# Deshalb: englisches MultiNet-Modell waehlen (mn7_en), damit
+# get_language_from_multinet_models() "en" ableitet.
+CONFIG_USE_AFE_WAKE_WORD=n
+CONFIG_USE_CUSTOM_WAKE_WORD=y
+CONFIG_CUSTOM_WAKE_WORD="elektra;electra;elektrah;alektra;hey elektra;hallo elektra"
+CONFIG_CUSTOM_WAKE_WORD_DISPLAY="Elektra"
+CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=4
+CONFIG_SR_MN_EN_MULTINET7_QUANT=y
+
+# Schlaf: Hintergrundbeleuchtung so weit runter, dass das Atmen des Rings
+# vom Sofa aus noch sichtbar ist. Der Wert wird am Geraet eingestellt.
+CONFIG_ELEKTRA_SCHLAF_HELLIGKEIT=35

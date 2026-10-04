@@ -1,0 +1,103 @@
+diff --git a/main/audio/wake_words/custom_wake_word.cc b/main/audio/wake_words/custom_wake_word.cc
+index 681d02c..4b53fc3 100644
+--- a/main/audio/wake_words/custom_wake_word.cc
++++ b/main/audio/wake_words/custom_wake_word.cc
+@@ -4,12 +4,33 @@
+ #include "assets.h"
+ 
+ #include <esp_log.h>
++#include <algorithm>
+ #include <esp_mn_iface.h>
+ #include <esp_mn_models.h>
+ #include <esp_mn_speech_commands.h>
+ #include <cJSON.h>
+ 
+ #define TAG "CustomWakeWord"
++static constexpr float MESSSCHWELLE = 0.03f;
++static constexpr float WAKE_GAIN = 3.0f;
++
++// rundfunk: mehrere Schreibweisen desselben Wake-Words, mit ';' getrennt. Das
++// englische MultiNet-Modell kennt nur seine eigene Aussprache von "elektra";
++// deutsche Varianten erhöhen die Trefferquote (13.09.2026).
++static std::vector<std::string> SchreibweisenTrennen(const std::string& alle) {
++    std::vector<std::string> ergebnis;
++    size_t start = 0;
++    while (start <= alle.size()) {
++        size_t ende = alle.find(';', start);
++        if (ende == std::string::npos) ende = alle.size();
++        std::string wort = alle.substr(start, ende - start);
++        size_t a = wort.find_first_not_of(' ');
++        size_t b = wort.find_last_not_of(' ');
++        if (a != std::string::npos) ergebnis.push_back(wort.substr(a, b - a + 1));
++        start = ende + 1;
++    }
++    return ergebnis;
++}
+ 
+ CustomWakeWord::CustomWakeWord()
+     : wake_word_opus_() {
+@@ -71,8 +92,10 @@ void CustomWakeWord::ParseWakenetModelConfig() {
+                     cJSON* text = cJSON_GetObjectItem(command, "text");
+                     cJSON* action = cJSON_GetObjectItem(command, "action");
+                     if (cJSON_IsString(command_name) && cJSON_IsString(text) && cJSON_IsString(action)) {
+-                        commands_.push_back({command_name->valuestring, text->valuestring, action->valuestring});
+-                        ESP_LOGI(TAG, "Command: %s, Text: %s, Action: %s", command_name->valuestring, text->valuestring, action->valuestring);
++                        for (auto& wort : SchreibweisenTrennen(command_name->valuestring)) {
++                            commands_.push_back({wort, text->valuestring, action->valuestring});
++                            ESP_LOGI(TAG, "Command: %s, Text: %s, Action: %s", wort.c_str(), text->valuestring, action->valuestring);
++                        }
+                     }
+                 }
+             }
+@@ -92,7 +115,9 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list)
+         owns_models_ = models_ != nullptr;
+ #ifdef CONFIG_CUSTOM_WAKE_WORD
+         threshold_ = CONFIG_CUSTOM_WAKE_WORD_THRESHOLD / 100.0f;
+-        commands_.push_back({CONFIG_CUSTOM_WAKE_WORD, CONFIG_CUSTOM_WAKE_WORD_DISPLAY, "wake"});
++        for (auto& wort : SchreibweisenTrennen(CONFIG_CUSTOM_WAKE_WORD)) {
++            commands_.push_back({wort, CONFIG_CUSTOM_WAKE_WORD_DISPLAY, "wake"});
++        }
+ #endif
+     } else {
+         models_ = models_list;
+@@ -118,7 +143,11 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list)
+ 
+     multinet_ = esp_mn_handle_from_name(mn_name_);
+     multinet_model_data_ = multinet_->create(mn_name_, duration_);
+-    multinet_->set_det_threshold(multinet_model_data_, threshold_);
++    // rundfunk: MultiNet meldet ab einer niedrigen Messschwelle, damit auch
++    // Versuche unter der eigentlichen Schwelle im Log stehen ("Elektra aus
++    // 1 m mit normaler Stimme funktioniert nicht", 13.09.2026). Ausgelöst
++    // wird erst ab threshold_ (siehe FeedSamples).
++    multinet_->set_det_threshold(multinet_model_data_, std::min(threshold_, MESSSCHWELLE));
+     input_buffer_.reserve(multinet_->get_samp_chunksize(multinet_model_data_));
+     esp_mn_commands_clear();
+     for (int i = 0; i < commands_.size(); i++) {
+@@ -177,6 +206,16 @@ void CustomWakeWord::FeedSamples(const int16_t* data, size_t samples, bool mono)
+     } else {
+         input_buffer_.insert(input_buffer_.end(), data, data + samples);
+     }
++    if (WAKE_GAIN != 1.0f) {
++        // rundfunk: Rufe aus der Ferne kommen leise an, und in der
++        // Zwei-Mikrofon-Kette gibt es keine Pegelregelung. Nur der Erkenner
++        // bekommt die Verstaerkung, nicht das Audio zur Cloud (13.09.2026).
++        size_t von = input_buffer_.size() - (mono ? samples : samples / codec_->input_channels());
++        for (size_t i = von; i < input_buffer_.size(); ++i) {
++            float v = input_buffer_[i] * WAKE_GAIN;
++            input_buffer_[i] = v > 32767.f ? 32767 : (v < -32768.f ? -32768 : (int16_t)v);
++        }
++    }
+     
+     int chunksize = multinet_->get_samp_chunksize(multinet_model_data_);
+     while (input_buffer_.size() >= chunksize) {
+@@ -191,6 +230,10 @@ void CustomWakeWord::FeedSamples(const int16_t* data, size_t samples, bool mono)
+             for (int i = 0; i < mn_result->num && running_; i++) {
+                 ESP_LOGI(TAG, "Custom wake word detected: command_id=%d, string=%s, prob=%f", 
+                         mn_result->command_id[i], mn_result->string, mn_result->prob[i]);
++                if (mn_result->prob[i] < threshold_) {
++                    ESP_LOGI(TAG, "unter Schwelle %.2f -- nicht ausgeloest", threshold_);
++                    continue;
++                }
+                 auto& command = commands_[mn_result->command_id[i] - 1];
+                 if (command.action == "wake") {
+                     last_detected_wake_word_ = command.text;
