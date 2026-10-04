@@ -100,8 +100,12 @@ It works, but not well enough: measured on 20 September 2026, **8 of 10 calls
 from 2 m** triggered, with scores of only 4–15 %. A real WakeNet model scores
 close to 1.0 on a clean hit. The AFE logs `wakenet model not found` at start.
 
-We would like a WakeNet model for **"Elektra"**. See the request in
-[espressif/esp-sr#88](https://github.com/espressif/esp-sr/issues/88).
+We are not pursuing a custom WakeNet model: the name is a common word that is
+registered as a trademark by several companies, and Espressif requires the
+requester to confirm the rights to a wake word. Instead we stay with the
+MultiNet workaround and tune it by measurement: threshold 3 % against 4 %,
+20 calls each from 2 m and 4 m, plus an hour of TV in the room to count false
+triggers.
 
 ## Licence
 
